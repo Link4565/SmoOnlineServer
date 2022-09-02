@@ -17,23 +17,26 @@ public class Server {
     public event Action<Client, ConnectPacket> ClientJoined = null!;
 
     public async Task Listen(CancellationToken? token = null) {
-        Socket serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        serverSocket.Bind(new IPEndPoint(IPAddress.Parse(Settings.Instance.Server.Address), Settings.Instance.Server.Port));
-        serverSocket.Listen();
+        Socket serverSocketTcp = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        serverSocketTcp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        serverSocketTcp.Bind(new IPEndPoint(IPAddress.Parse(Settings.Instance.Server.Address), Settings.Instance.Server.Port));
+        serverSocketTcp.Listen();
+        Socket serverSocketUdp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        serverSocketUdp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        serverSocketUdp.Bind(new IPEndPoint(IPAddress.Parse(Settings.Instance.Server.Address), Settings.Instance.Server.Port));
 
-        Logger.Info($"Listening on {serverSocket.LocalEndPoint}");
+        Logger.Info($"Listening on {serverSocketTcp.LocalEndPoint}");
 
         try {
             while (true) {
-                Socket socket = token.HasValue ? await serverSocket.AcceptAsync(token.Value) : await serverSocket.AcceptAsync();
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                Socket socket_tcp = token.HasValue ? await serverSocketTcp.AcceptAsync(token.Value) : await serverSocketTcp.AcceptAsync();
+                socket_tcp.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
 
-                Logger.Warn($"Accepted connection for client {socket.RemoteEndPoint}");
+                Logger.Warn($"Accepted connection for client {socket_tcp.RemoteEndPoint}");
 
                 try {
 #pragma warning disable CS4014
-                    Task.Run(() => HandleSocket(socket))
+                    Task.Run(() => HandleSocket(socket_tcp,serverSocketUdp))
                         .ContinueWith(x => { if (x.Exception != null) { Logger.Error(x.Exception.ToString()); } });
 #pragma warning restore CS4014
                 }
@@ -48,13 +51,13 @@ public class Server {
             Logger.Info("Server closing");
 
             try {
-                serverSocket.Shutdown(SocketShutdown.Both);
+                serverSocketTcp.Shutdown(SocketShutdown.Both);
             }
             catch {
                 // ignored
             }
             finally {
-                serverSocket.Close();
+                serverSocketTcp.Close();
             }
 
             Logger.Info("Server closed");
@@ -125,7 +128,7 @@ public class Server {
     }
 
 
-    private async void HandleSocket(Socket socket) {
+    private async void HandleSocket(Socket socket, Socket serverSocketUdp) {
         Client client = new Client(socket) {Server = this};
         IMemoryOwner<byte> memory = null!;
         await client.Send(new InitPacket {
@@ -232,6 +235,11 @@ public class Server {
                         }
                     }
 
+                    await client.Send(new UseUdpPacket
+                    {
+                        UseUdp = true
+                    });
+
                     List<Client> otherConnectedPlayers = Clients.FindAll(c => c.Id != header.Id && c.Connected && c.Socket != null);
                     await Parallel.ForEachAsync(otherConnectedPlayers, async (other, _) => {
                         IMemoryOwner<byte> tempBuffer = MemoryPool<byte>.Shared.RentZero(Constants.HeaderSize + (other.CurrentCostume.HasValue ? Math.Max(connect.Size, other.CurrentCostume.Value.Size) : connect.Size));
@@ -314,6 +322,135 @@ public class Server {
             client.Dispose();
         }
         catch { /*lol*/ }
+
+#pragma warning disable CS4014
+        Task.Run(() => Broadcast(new DisconnectPacket(), client))
+            .ContinueWith(x => { if (x.Exception != null) { Logger.Error(x.Exception.ToString()); } });
+#pragma warning restore CS4014
+    }
+
+    private async void HandleSocketUdp(Socket socket, Socket serverSocketUdp)
+    {
+        Socket socket_udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        socket_udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        while (true)
+        {
+            EndPoint remote_endpoint = new IPEndPoint(0,0);
+            serverSocketUdp.ReceiveFrom(null, SocketFlags.None, ref remote_endpoint);
+            if (((IPEndPoint)remote_endpoint).Address == ((IPEndPoint)socket.RemoteEndPoint).Address)
+            {
+                socket_udp.Bind(new IPEndPoint(IPAddress.Parse(Settings.Instance.Server.Address), Settings.Instance.Server.Port));
+                socket_udp.Connect(remote_endpoint);
+                break;
+            }
+        }
+
+        IMemoryOwner<byte> memory = null!;
+        Client client = new Client(socket);
+
+        bool first = true;
+        try
+        {
+            while (true)
+            {
+                memory = memoryPool.Rent(Constants.HeaderSize);
+
+                async Task<bool> Read(Memory<byte> readMem, int readSize, int readOffset)
+                {
+                    readSize += readOffset;
+                    while (readOffset < readSize)
+                    {
+                        int size = await socket.ReceiveAsync(readMem[readOffset..readSize], SocketFlags.None);
+                        if (size == 0)
+                        {
+                            // treat it as a disconnect and exit
+                            Logger.Info($"Socket {socket.RemoteEndPoint} disconnected.");
+                            if (socket.Connected) await socket.DisconnectAsync(false);
+                            return false;
+                        }
+
+                        readOffset += size;
+                    }
+
+                    return true;
+                }
+
+                if (!await Read(memory.Memory[..Constants.HeaderSize], Constants.HeaderSize, 0))
+                    break;
+                PacketHeader header = GetHeader(memory.Memory.Span[..Constants.HeaderSize]);
+                Range packetRange = Constants.HeaderSize..(Constants.HeaderSize + header.PacketSize);
+                if (header.PacketSize > 0)
+                {
+                    IMemoryOwner<byte> memTemp = memory; // header to copy to new memory
+                    memory = memoryPool.Rent(Constants.HeaderSize + header.PacketSize);
+                    memTemp.Memory.Span[..Constants.HeaderSize].CopyTo(memory.Memory.Span[..Constants.HeaderSize]);
+                    memTemp.Dispose();
+                    if (!await Read(memory.Memory, header.PacketSize, Constants.HeaderSize))
+                        break;
+                }
+
+                // connection initialization
+                if (first)
+                {
+                    first = false;
+
+                    if (FindExistingClient(header.Id) is { } newClient)
+                    {
+                        client = newClient;
+                        client.SocketUdp = socket_udp;
+                    } else
+                    {
+                        break;
+                    }
+
+
+                    Logger.Info($"Client {client.Name} ({client.Id}/{socket.RemoteEndPoint}) connected over UDP.");
+                }
+                else if (header.Id != client.Id && client.Id != Guid.Empty)
+                {
+                    throw new Exception($"Client {client.Name} sent packet with invalid client id {header.Id} instead of {client.Id}");
+                }
+
+                try
+                {
+                    IPacket packet = (IPacket)Activator.CreateInstance(Constants.PacketIdMap[header.Type])!;
+                    packet.Deserialize(memory.Memory.Span[Constants.HeaderSize..(Constants.HeaderSize + packet.Size)]);
+                    if (PacketHandler?.Invoke(client, packet) is false)
+                    {
+                        memory.Dispose();
+                        continue;
+                    }
+                }
+                catch (Exception e)
+                {
+                    client.Logger.Error($"Packet handler warning: {e}");
+                }
+#pragma warning disable CS4014
+                Broadcast(memory, client)
+                    .ContinueWith(x => { if (x.Exception != null) { Logger.Error(x.Exception.ToString()); } });
+#pragma warning restore CS4014
+            }
+        }
+        catch (Exception e)
+        {
+            if (e is SocketException { SocketErrorCode: SocketError.ConnectionReset })
+            {
+                client.Logger.Info($"Disconnected from the server: Connection reset");
+            }
+            else
+            {
+                client.Logger.Error($"Disconnecting due to exception: {e}");
+                if (socket.Connected)
+                {
+#pragma warning disable CS4014
+                    Task.Run(() => socket.DisconnectAsync(false))
+                        .ContinueWith(x => { if (x.Exception != null) { Logger.Error(x.Exception.ToString()); } });
+#pragma warning restore CS4014
+                }
+            }
+
+            memory?.Dispose();
+        }
 
 #pragma warning disable CS4014
         Task.Run(() => Broadcast(new DisconnectPacket(), client))

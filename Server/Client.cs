@@ -20,6 +20,7 @@ public class Client : IDisposable {
 
     public Guid Id;
     public Socket? Socket;
+    public Socket? SocketUdp = null;
     public Server Server { get; init; } = null!; //init'd in object initializer
     public Logger Logger { get; }
 
